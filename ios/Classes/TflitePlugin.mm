@@ -1,6 +1,7 @@
 //#define CONTRIB_PATH
 #define TFLITE2
 
+#import <Flutter/Flutter.h>
 #import "TflitePlugin.h"
 
 #include <pthread.h>
@@ -11,14 +12,23 @@
 #include <sstream>
 #include <string>
 
+#include <stdlib.h>
+#include <string.h>
+#include <assert.h>
+#include <stdio.h>
+#include <vector>
+
+#import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
+
 #ifdef CONTRIB_PATH
 #include "tensorflow/contrib/lite/kernels/register.h"
 #include "tensorflow/contrib/lite/model.h"
 #include "tensorflow/contrib/lite/string_util.h"
 #include "tensorflow/contrib/lite/op_resolver.h"
 #elif defined TFLITE2
-#import "TensorFlowLiteC.h"
-#import "metal_delegate.h"
+#import "TensorFlowLiteC/TensorFlowLiteC.h"
+//#import "metal_delegate.h"
 #else
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
@@ -26,7 +36,7 @@
 #include "tensorflow/lite/op_resolver.h"
 #endif
 
-#include "ios_image_load.h"
+//#include "ios_image_load.h"
 
 #define LOG(x) std::cerr
 
@@ -162,10 +172,10 @@ NSString* loadModel(NSObject<FlutterPluginRegistrar>* _registrar, NSDictionary* 
   TfLiteInterpreterOptionsSetNumThreads(options, num_threads);
   
   bool useGpuDelegate = [args[@"useGpuDelegate"] boolValue];
-  if (useGpuDelegate) {
-    delegate = TFLGpuDelegateCreate(nullptr);
-    TfLiteInterpreterOptionsAddDelegate(options, delegate);
-  }
+//  if (useGpuDelegate) {
+//    delegate = TFLGpuDelegateCreate(nullptr);
+//    TfLiteInterpreterOptionsAddDelegate(options, delegate);
+//  }
 #else
   model = tflite::FlatBufferModel::BuildFromFile([graph_path UTF8String]);
   if (!model) {
@@ -399,6 +409,69 @@ void feedInputTensor(uint8_t* in, int* input_size, int image_height, int image_w
   }
 }
 
+std::vector<uint8_t> LoadImageFromFile(const char* file_name,
+                                       int* out_width, int* out_height,
+                                       int* out_channels) {
+    FILE* file_handle = fopen(file_name, "rb");
+    fseek(file_handle, 0, SEEK_END);
+    const size_t bytes_in_file = ftell(file_handle);
+    fseek(file_handle, 0, SEEK_SET);
+    std::vector<uint8_t> file_data(bytes_in_file);
+    fread(file_data.data(), 1, bytes_in_file, file_handle);
+    fclose(file_handle);
+
+    CFDataRef file_data_ref = CFDataCreateWithBytesNoCopy(NULL, file_data.data(),
+                                                          bytes_in_file,
+                                                          kCFAllocatorNull);
+    CGDataProviderRef image_provider = CGDataProviderCreateWithCFData(file_data_ref);
+
+    const char* suffix = strrchr(file_name, '.');
+    if (!suffix || suffix == file_name) {
+        suffix = "";
+    }
+    CGImageRef image;
+    if (strcasecmp(suffix, ".png") == 0) {
+        image = CGImageCreateWithPNGDataProvider(image_provider, NULL, true,
+                                                 kCGRenderingIntentDefault);
+    } else if ((strcasecmp(suffix, ".jpg") == 0) ||
+               (strcasecmp(suffix, ".jpeg") == 0)) {
+        image = CGImageCreateWithJPEGDataProvider(image_provider, NULL, true,
+                                                  kCGRenderingIntentDefault);
+    } else {
+        CFRelease(image_provider);
+        CFRelease(file_data_ref);
+        fprintf(stderr, "Unknown suffix for file '%s'\n", file_name);
+        out_width = 0;
+        out_height = 0;
+        *out_channels = 0;
+        return std::vector<uint8_t>();
+    }
+
+    int width = (int)CGImageGetWidth(image);
+    int height = (int)CGImageGetHeight(image);
+    const int channels = 4;
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    const int bytes_per_row = (width * channels);
+    const int bytes_in_image = (bytes_per_row * height);
+    std::vector<uint8_t> result(bytes_in_image);
+    const int bits_per_component = 8;
+
+    CGContextRef context = CGBitmapContextCreate(result.data(), width, height,
+                                                 bits_per_component, bytes_per_row, color_space,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(color_space);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextRelease(context);
+    CFRelease(image);
+    CFRelease(image_provider);
+    CFRelease(file_data_ref);
+
+    *out_width = width;
+    *out_height = height;
+    *out_channels = channels;
+    return result;
+}
+
 void feedInputTensorImage(const NSString* image_path, float input_mean, float input_std, int* input_size) {
   int image_channels;
   int image_height;
@@ -413,6 +486,27 @@ void feedInputTensorFrame(const FlutterStandardTypedData* typedData, int* input_
   uint8_t* in = (uint8_t*)[[typedData data] bytes];
   feedInputTensor(in, input_size, image_height, image_width, image_channels, input_mean, input_std);
 }
+
+NSData *CompressImage(NSMutableData *image, int width, int height, int bytesPerPixel) {
+    const int channels = 4;
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate([image mutableBytes], width, height,
+                                                 bytesPerPixel*8, width*channels*bytesPerPixel, color_space,
+                                                 kCGImageAlphaPremultipliedLast | (bytesPerPixel == 4 ? kCGBitmapFloatComponents : kCGBitmapByteOrder32Big));
+    CGColorSpaceRelease(color_space);
+    if (context == nil) return nil;
+
+    CGImageRef imgRef = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    if (imgRef == nil) return nil;
+
+    UIImage* img = [UIImage imageWithCGImage:imgRef];
+    CGImageRelease(imgRef);
+    if (img == nil) return nil;
+
+    return UIImagePNGRepresentation(img);
+}
+
 
 NSMutableArray* GetTopN(const float* prediction, const unsigned long prediction_size, const int num_results,
                     const float threshold) {
@@ -1488,8 +1582,8 @@ void runPoseNetOnFrame(NSDictionary* args, FlutterResult result) {
 void close() {
 #ifdef TFLITE2
   interpreter = nullptr;
-  if (delegate != nullptr)
-    TFLGpuDelegateDelete(delegate);
+//  if (delegate != nullptr)
+//    TFLGpuDelegateDelete(delegate);
   delegate = nullptr;
 #else
   interpreter.release();

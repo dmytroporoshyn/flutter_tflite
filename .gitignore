@@ -9,6 +9,7 @@ build/
 
 # IntelliJ
 *.iml
+.idea/
 .idea/workspace.xml
 .idea/tasks.xml
 .idea/gradle.xml
@@ -16,3 +17,6 @@ build/
 .idea/dictionaries
 .idea/libraries
 .idea/caches
+
+# FVM Version Cache
+.fvm/
